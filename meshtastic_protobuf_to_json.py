@@ -94,7 +94,7 @@ class MeshtasticConverter:
             from_node = getattr(packet, 'from')
             
 
-            nonce = struct.pack('<I', packet_id) + struct.pack('<I', from_node) + bytes(8)
+            nonce = struct.pack('<I', packet_id) + bytes(4) + struct.pack('<I', from_node) + bytes(4)
             
 
             cipher = Cipher(algorithms.AES(key), modes.CTR(nonce), backend=default_backend())
