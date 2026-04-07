@@ -370,6 +370,25 @@ class MeshtasticConverter:
                 result["relative_humidity"] = em.relative_humidity
             if em.HasField('barometric_pressure'):
                 result["barometric_pressure"] = em.barometric_pressure
+        elif telemetry.HasField('host_metrics'):
+            hm = telemetry.host_metrics
+            if hm.uptime_seconds != 0:
+                result["uptime_seconds"] = hm.uptime_seconds
+            if hm.freemem_bytes != 0:
+                result["freemem_bytes"] = hm.freemem_bytes
+            if hm.diskfree1_bytes != 0:
+                result["diskfree1_bytes"] = hm.diskfree1_bytes
+            if hm.diskfree2_bytes != 0:
+                result["diskfree2_bytes"] = hm.diskfree2_bytes
+            if hm.diskfree3_bytes != 0:
+                result["diskfree3_bytes"] = hm.diskfree2_bytes
+            if hm.load1 != 0:
+                result["load1"] = hm.load1/100
+            if hm.load5 != 0:
+                result["load5"] = hm.load5/100
+            if hm.load15 != 0:
+                result["load15"] = hm.load15/100
+
         
         return result
     
