@@ -8,7 +8,6 @@ Subscribes to Protobuf MQTT topics, converts packets to JSON, and republishes th
 import paho.mqtt.client as mqtt
 import json
 import base64
-from typing import Optional, Dict, Any
 import logging
 import argparse
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
@@ -21,7 +20,7 @@ except ImportError:
     print("Error: Install dependencies with: pip install -r requirements.txt")
     exit(1)
 
-# Optional payload types; absent in some older meshtastic python builds.
+# Optional payload types (absent in older meshtastic builds).
 try:
     from meshtastic import remote_hardware_pb2
 except ImportError:
@@ -220,8 +219,7 @@ class MeshtasticConverter:
             if 'channel' in json_data:
                 packet.channel = json_data['channel']
 
-            # Firmware's downlink envelope used "hopLimit" (camelCase); accept
-            # that as well as the snake_case spelling for compatibility.
+            # Firmware used camelCase "hopLimit"; accept both spellings.
             if 'hopLimit' in json_data:
                 packet.hop_limit = json_data['hopLimit']
             elif 'hop_limit' in json_data:
@@ -239,8 +237,7 @@ class MeshtasticConverter:
             elif msg_type == 'sendposition':
                 packet.decoded.portnum = portnums_pb2.PortNum.POSITION_APP
                 pos = mesh_pb2.Position()
-                # Firmware reads raw scaled integers (latitude_i/longitude_i);
-                # decimal latitude/longitude are accepted as a fallback.
+                # Prefer raw latitude_i/longitude_i; fall back to decimal.
                 if 'latitude_i' in payload_data:
                     pos.latitude_i = int(payload_data['latitude_i'])
                 elif 'latitude' in payload_data:
@@ -295,9 +292,7 @@ class MeshtasticConverter:
             json_data = self.convert_to_json(envelope)
             if json_data:
                 json_topic = f"{self.root_topic}/{self.region}/2/json/{channel}/{user_id}"
-                # sort_keys mirrors the firmware serializer, whose SimpleJSON
-                # JSONObject is a std::map and therefore emitted object keys in
-                # alphabetical order. Keeps the JSON byte-compatible.
+                # sort_keys matches the firmware's std::map (alphabetical) order.
                 client.publish(json_topic, json.dumps(json_data, separators=(',', ':'), sort_keys=True))
                 logger.debug(f"Protobuf->JSON: {msg.topic} -> {json_topic}")
         except Exception as e:
@@ -305,8 +300,7 @@ class MeshtasticConverter:
     
     @staticmethod
     def hops_away(packet):
-        # Matches firmware getHopsAway(): valid only when hop_start is set and
-        # hop_limit has not exceeded it; returns -1 ("unknown") otherwise.
+        # Firmware getHopsAway(): -1 (unknown) unless hop_start is set and not exceeded.
         if packet.hop_start != 0 and packet.hop_limit <= packet.hop_start:
             return packet.hop_start - packet.hop_limit
         return -1
@@ -332,9 +326,7 @@ class MeshtasticConverter:
         if portnum == portnums_pb2.PortNum.TEXT_MESSAGE_APP:
             json_obj["type"] = "text"
             text = decoded.payload.decode('utf-8', errors='ignore')
-            # The firmware passes a text payload that is itself valid JSON
-            # straight through as the "payload" object; otherwise it wraps the
-            # string as {"text": ...}.
+            # A JSON text payload passes through; otherwise wrap as {"text": ...}.
             try:
                 payload = json.loads(text)
             except (json.JSONDecodeError, ValueError):
@@ -384,9 +376,7 @@ class MeshtasticConverter:
         return None
     
     def convert_position(self, decoded):
-        # Mirror the firmware MeshPacketSerializer: emit raw scaled integers
-        # (latitude_i/longitude_i) rather than decimal degrees, and gate the
-        # optional fields on a non-zero value exactly as the firmware did.
+        # Raw latitude_i/longitude_i; optional fields gated on non-zero like the firmware.
         try:
             pos = mesh_pb2.Position()
             pos.ParseFromString(decoded.payload)
@@ -436,8 +426,7 @@ class MeshtasticConverter:
         
         if telemetry.HasField('device_metrics'):
             dm = telemetry.device_metrics
-            # battery_level is gated on presence by the firmware; the other
-            # three device metrics are always emitted.
+            # battery_level is presence-gated; the rest are always emitted.
             if dm.HasField('battery_level'):
                 result["battery_level"] = dm.battery_level
             result["voltage"] = dm.voltage
@@ -543,7 +532,6 @@ class MeshtasticConverter:
             if hm.load15 != 0:
                 result["load15"] = hm.load15/100
 
-        
         return result
     
     def convert_waypoint(self, decoded):
@@ -572,10 +560,8 @@ class MeshtasticConverter:
         }
 
     def convert_traceroute(self, packet, decoded):
-        # The firmware resolves each hop to a node long-name via its local
-        # NodeDB. A standalone converter has no such database, so hops are
-        # rendered as "!aabbccdd" node-id strings instead. SNR values are
-        # stored as quarter-dB in the protobuf, matching the firmware's /4.
+        # No NodeDB here, so hops render as "!aabbccdd" ids (firmware uses long-names).
+        # SNR is quarter-dB in the protobuf, hence /4.
         try:
             route_disc = mesh_pb2.RouteDiscovery()
             route_disc.ParseFromString(decoded.payload)
@@ -618,8 +604,7 @@ class MeshtasticConverter:
             return None
 
     def convert_remotehardware(self, decoded, json_obj):
-        # Sets json_obj["type"] itself, mirroring the firmware which derives the
-        # type ("gpios_changed"/"gpios_read_reply") from the HardwareMessage.
+        # Sets json_obj["type"] itself (gpios_changed / gpios_read_reply).
         if remote_hardware_pb2 is None:
             logger.warning("remote_hardware_pb2 unavailable; cannot decode remote hardware")
             return None
