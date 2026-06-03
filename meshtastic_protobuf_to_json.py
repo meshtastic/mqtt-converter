@@ -21,6 +21,16 @@ except ImportError:
     print("Error: Install dependencies with: pip install -r requirements.txt")
     exit(1)
 
+# Optional payload types; absent in some older meshtastic python builds.
+try:
+    from meshtastic import remote_hardware_pb2
+except ImportError:
+    remote_hardware_pb2 = None
+try:
+    from meshtastic import paxcount_pb2
+except ImportError:
+    paxcount_pb2 = None
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
@@ -209,28 +219,40 @@ class MeshtasticConverter:
             
             if 'channel' in json_data:
                 packet.channel = json_data['channel']
-            
-            if 'hop_limit' in json_data:
+
+            # Firmware's downlink envelope used "hopLimit" (camelCase); accept
+            # that as well as the snake_case spelling for compatibility.
+            if 'hopLimit' in json_data:
+                packet.hop_limit = json_data['hopLimit']
+            elif 'hop_limit' in json_data:
                 packet.hop_limit = json_data['hop_limit']
-            
+
 
             msg_type = json_data.get('type', '')
             payload_data = json_data.get('payload', {})
-            
+
             if msg_type == 'sendtext':
                 packet.decoded.portnum = portnums_pb2.PortNum.TEXT_MESSAGE_APP
                 text = payload_data if isinstance(payload_data, str) else payload_data.get('text', '')
                 packet.decoded.payload = text.encode('utf-8')
-                
+
             elif msg_type == 'sendposition':
                 packet.decoded.portnum = portnums_pb2.PortNum.POSITION_APP
                 pos = mesh_pb2.Position()
-                if 'latitude' in payload_data:
+                # Firmware reads raw scaled integers (latitude_i/longitude_i);
+                # decimal latitude/longitude are accepted as a fallback.
+                if 'latitude_i' in payload_data:
+                    pos.latitude_i = int(payload_data['latitude_i'])
+                elif 'latitude' in payload_data:
                     pos.latitude_i = int(payload_data['latitude'] * 1e7)
-                if 'longitude' in payload_data:
+                if 'longitude_i' in payload_data:
+                    pos.longitude_i = int(payload_data['longitude_i'])
+                elif 'longitude' in payload_data:
                     pos.longitude_i = int(payload_data['longitude'] * 1e7)
                 if 'altitude' in payload_data:
-                    pos.altitude = payload_data['altitude']
+                    pos.altitude = int(payload_data['altitude'])
+                if 'time' in payload_data:
+                    pos.time = int(payload_data['time'])
                 packet.decoded.payload = pos.SerializeToString()
             else:
                 logger.warning(f"Unknown message type for downlink: {msg_type}")
@@ -273,19 +295,30 @@ class MeshtasticConverter:
             json_data = self.convert_to_json(envelope)
             if json_data:
                 json_topic = f"{self.root_topic}/{self.region}/2/json/{channel}/{user_id}"
-                client.publish(json_topic, json.dumps(json_data, separators=(',', ':')))
+                # sort_keys mirrors the firmware serializer, whose SimpleJSON
+                # JSONObject is a std::map and therefore emitted object keys in
+                # alphabetical order. Keeps the JSON byte-compatible.
+                client.publish(json_topic, json.dumps(json_data, separators=(',', ':'), sort_keys=True))
                 logger.debug(f"Protobuf->JSON: {msg.topic} -> {json_topic}")
         except Exception as e:
             logger.error(f"Error converting Protobuf to JSON: {e}")
     
+    @staticmethod
+    def hops_away(packet):
+        # Matches firmware getHopsAway(): valid only when hop_start is set and
+        # hop_limit has not exceeded it; returns -1 ("unknown") otherwise.
+        if packet.hop_start != 0 and packet.hop_limit <= packet.hop_start:
+            return packet.hop_start - packet.hop_limit
+        return -1
+
     def convert_to_json(self, envelope):
         packet = envelope.packet
         if not packet.HasField('decoded'):
             return None
-        
+
         decoded = packet.decoded
         portnum = decoded.portnum
-        
+
         json_obj = {
             "id": packet.id,
             "timestamp": packet.rx_time if packet.rx_time > 0 else 0,
@@ -294,11 +327,18 @@ class MeshtasticConverter:
             "channel": packet.channel,
             "sender": envelope.gateway_id if envelope.gateway_id else f"!{getattr(packet, 'from'):08x}"
         }
-        
+
         payload = None
         if portnum == portnums_pb2.PortNum.TEXT_MESSAGE_APP:
             json_obj["type"] = "text"
-            payload = {"text": decoded.payload.decode('utf-8', errors='ignore')}
+            text = decoded.payload.decode('utf-8', errors='ignore')
+            # The firmware passes a text payload that is itself valid JSON
+            # straight through as the "payload" object; otherwise it wraps the
+            # string as {"text": ...}.
+            try:
+                payload = json.loads(text)
+            except (json.JSONDecodeError, ValueError):
+                payload = {"text": text}
         elif portnum == portnums_pb2.PortNum.POSITION_APP:
             json_obj["type"] = "position"
             payload = self.convert_position(decoded)
@@ -314,31 +354,70 @@ class MeshtasticConverter:
         elif portnum == portnums_pb2.PortNum.NEIGHBORINFO_APP:
             json_obj["type"] = "neighborinfo"
             payload = self.convert_neighborinfo(decoded)
-        
-        if payload:
+        elif portnum == portnums_pb2.PortNum.TRACEROUTE_APP:
+            # Firmware only serializes the traceroute reply (request_id set).
+            if decoded.request_id:
+                json_obj["type"] = "traceroute"
+                payload = self.convert_traceroute(packet, decoded)
+        elif portnum == portnums_pb2.PortNum.DETECTION_SENSOR_APP:
+            json_obj["type"] = "detection"
+            payload = {"text": decoded.payload.decode('utf-8', errors='ignore')}
+        elif portnum == portnums_pb2.PortNum.PAXCOUNTER_APP:
+            json_obj["type"] = "paxcounter"
+            payload = self.convert_paxcounter(decoded)
+        elif portnum == portnums_pb2.PortNum.REMOTE_HARDWARE_APP:
+            payload = self.convert_remotehardware(decoded, json_obj)
+
+        # Radio metadata, gated exactly as the firmware gates it.
+        if packet.rx_rssi != 0:
+            json_obj["rssi"] = packet.rx_rssi
+        if packet.rx_snr != 0:
+            json_obj["snr"] = packet.rx_snr
+        hops = self.hops_away(packet)
+        if hops >= 0:
+            json_obj["hops_away"] = hops
+            json_obj["hop_start"] = packet.hop_start
+
+        if payload is not None and json_obj.get("type"):
             json_obj["payload"] = payload
             return json_obj
         return None
     
     def convert_position(self, decoded):
+        # Mirror the firmware MeshPacketSerializer: emit raw scaled integers
+        # (latitude_i/longitude_i) rather than decimal degrees, and gate the
+        # optional fields on a non-zero value exactly as the firmware did.
         try:
             pos = mesh_pb2.Position()
             pos.ParseFromString(decoded.payload)
             result = {}
-            if pos.HasField('latitude_i'):
-                result["latitude"] = pos.latitude_i * 1e-7
-            if pos.HasField('longitude_i'):
-                result["longitude"] = pos.longitude_i * 1e-7
-            if pos.HasField('altitude'):
-                result["altitude"] = pos.altitude
-
             if pos.time:
                 result["time"] = pos.time
+            if pos.timestamp:
+                result["timestamp"] = pos.timestamp
+            result["latitude_i"] = pos.latitude_i
+            result["longitude_i"] = pos.longitude_i
+            if pos.altitude:
+                result["altitude"] = pos.altitude
+            if pos.ground_speed:
+                result["ground_speed"] = pos.ground_speed
+            if pos.ground_track:
+                result["ground_track"] = pos.ground_track
+            if pos.sats_in_view:
+                result["sats_in_view"] = pos.sats_in_view
+            if pos.PDOP:
+                result["PDOP"] = pos.PDOP
+            if pos.HDOP:
+                result["HDOP"] = pos.HDOP
+            if pos.VDOP:
+                result["VDOP"] = pos.VDOP
+            if pos.precision_bits:
+                result["precision_bits"] = pos.precision_bits
             return result
         except Exception as e:
             logger.error(f"Error decoding position: {e}")
             return {}
-    
+
     def convert_nodeinfo(self, decoded):
         user = mesh_pb2.User()
         user.ParseFromString(decoded.payload)
@@ -346,7 +425,8 @@ class MeshtasticConverter:
             "id": user.id,
             "longname": user.long_name,
             "shortname": user.short_name,
-            "hardware": user.hw_model
+            "hardware": int(user.hw_model),
+            "role": int(user.role)
         }
     
     def convert_telemetry(self, decoded):
@@ -356,12 +436,14 @@ class MeshtasticConverter:
         
         if telemetry.HasField('device_metrics'):
             dm = telemetry.device_metrics
-            result.update({
-                "battery_level": dm.battery_level,
-                "voltage": dm.voltage,
-                "channel_utilization": dm.channel_utilization,
-                "air_util_tx": dm.air_util_tx
-            })
+            # battery_level is gated on presence by the firmware; the other
+            # three device metrics are always emitted.
+            if dm.HasField('battery_level'):
+                result["battery_level"] = dm.battery_level
+            result["voltage"] = dm.voltage
+            result["channel_utilization"] = dm.channel_utilization
+            result["air_util_tx"] = dm.air_util_tx
+            result["uptime_seconds"] = dm.uptime_seconds
         elif telemetry.HasField('environment_metrics'):
             em = telemetry.environment_metrics
             if em.HasField('temperature'):
@@ -370,6 +452,78 @@ class MeshtasticConverter:
                 result["relative_humidity"] = em.relative_humidity
             if em.HasField('barometric_pressure'):
                 result["barometric_pressure"] = em.barometric_pressure
+            if em.HasField('gas_resistance'):
+                result["gas_resistance"] = em.gas_resistance
+            if em.HasField('voltage'):
+                result["voltage"] = em.voltage
+            if em.HasField('current'):
+                result["current"] = em.current
+            if em.HasField('lux'):
+                result["lux"] = em.lux
+            if em.HasField('white_lux'):
+                result["white_lux"] = em.white_lux
+            if em.HasField('iaq'):
+                result["iaq"] = em.iaq
+            if em.HasField('distance'):
+                result["distance"] = em.distance
+            if em.HasField('wind_speed'):
+                result["wind_speed"] = em.wind_speed
+            if em.HasField('wind_direction'):
+                result["wind_direction"] = em.wind_direction
+            if em.HasField('wind_gust'):
+                result["wind_gust"] = em.wind_gust
+            if em.HasField('wind_lull'):
+                result["wind_lull"] = em.wind_lull
+            if em.HasField('radiation'):
+                result["radiation"] = em.radiation
+            if em.HasField('ir_lux'):
+                result["ir_lux"] = em.ir_lux
+            if em.HasField('uv_lux'):
+                result["uv_lux"] = em.uv_lux
+            if em.HasField('weight'):
+                result["weight"] = em.weight
+            if em.HasField('rainfall_1h'):
+                result["rainfall_1h"] = em.rainfall_1h
+            if em.HasField('rainfall_24h'):
+                result["rainfall_24h"] = em.rainfall_24h
+            if em.HasField('soil_moisture'):
+                result["soil_moisture"] = em.soil_moisture
+            if em.HasField('soil_temperature'):
+                result["soil_temperature"] = em.soil_temperature
+        elif telemetry.HasField('air_quality_metrics'):
+            aq = telemetry.air_quality_metrics
+            if aq.HasField('pm10_standard'):
+                result["pm10"] = aq.pm10_standard
+            if aq.HasField('pm25_standard'):
+                result["pm25"] = aq.pm25_standard
+            if aq.HasField('pm100_standard'):
+                result["pm100"] = aq.pm100_standard
+            if aq.HasField('co2'):
+                result["co2"] = aq.co2
+            if aq.HasField('co2_temperature'):
+                result["co2_temperature"] = aq.co2_temperature
+            if aq.HasField('co2_humidity'):
+                result["co2_humidity"] = aq.co2_humidity
+            if aq.HasField('form_formaldehyde'):
+                result["form_formaldehyde"] = aq.form_formaldehyde
+            if aq.HasField('form_temperature'):
+                result["form_temperature"] = aq.form_temperature
+            if aq.HasField('form_humidity'):
+                result["form_humidity"] = aq.form_humidity
+        elif telemetry.HasField('power_metrics'):
+            pm = telemetry.power_metrics
+            if pm.HasField('ch1_voltage'):
+                result["voltage_ch1"] = pm.ch1_voltage
+            if pm.HasField('ch1_current'):
+                result["current_ch1"] = pm.ch1_current
+            if pm.HasField('ch2_voltage'):
+                result["voltage_ch2"] = pm.ch2_voltage
+            if pm.HasField('ch2_current'):
+                result["current_ch2"] = pm.ch2_current
+            if pm.HasField('ch3_voltage'):
+                result["voltage_ch3"] = pm.ch3_voltage
+            if pm.HasField('ch3_current'):
+                result["current_ch3"] = pm.ch3_current
         elif telemetry.HasField('host_metrics'):
             hm = telemetry.host_metrics
             if hm.uptime_seconds != 0:
@@ -381,7 +535,7 @@ class MeshtasticConverter:
             if hm.diskfree2_bytes != 0:
                 result["diskfree2_bytes"] = hm.diskfree2_bytes
             if hm.diskfree3_bytes != 0:
-                result["diskfree3_bytes"] = hm.diskfree2_bytes
+                result["diskfree3_bytes"] = hm.diskfree3_bytes
             if hm.load1 != 0:
                 result["load1"] = hm.load1/100
             if hm.load5 != 0:
@@ -395,21 +549,94 @@ class MeshtasticConverter:
     def convert_waypoint(self, decoded):
         waypoint = mesh_pb2.Waypoint()
         waypoint.ParseFromString(decoded.payload)
+        # Firmware emits raw latitude_i/longitude_i plus the lifecycle fields.
         return {
             "id": waypoint.id,
             "name": waypoint.name,
-            "latitude": waypoint.latitude_i * 1e-7,
-            "longitude": waypoint.longitude_i * 1e-7
+            "description": waypoint.description,
+            "expire": waypoint.expire,
+            "locked_to": waypoint.locked_to,
+            "latitude_i": waypoint.latitude_i,
+            "longitude_i": waypoint.longitude_i
         }
-    
+
     def convert_neighborinfo(self, decoded):
         neighbor_info = mesh_pb2.NeighborInfo()
         neighbor_info.ParseFromString(decoded.payload)
         return {
             "node_id": neighbor_info.node_id,
-            "neighbors": [{"node_id": n.node_id, "snr": n.snr} for n in neighbor_info.neighbors]
+            "node_broadcast_interval_secs": neighbor_info.node_broadcast_interval_secs,
+            "last_sent_by_id": neighbor_info.last_sent_by_id,
+            "neighbors_count": len(neighbor_info.neighbors),
+            "neighbors": [{"node_id": n.node_id, "snr": int(n.snr)} for n in neighbor_info.neighbors]
         }
-    
+
+    def convert_traceroute(self, packet, decoded):
+        # The firmware resolves each hop to a node long-name via its local
+        # NodeDB. A standalone converter has no such database, so hops are
+        # rendered as "!aabbccdd" node-id strings instead. SNR values are
+        # stored as quarter-dB in the protobuf, matching the firmware's /4.
+        try:
+            route_disc = mesh_pb2.RouteDiscovery()
+            route_disc.ParseFromString(decoded.payload)
+
+            def node_name(num):
+                return f"!{num & 0xffffffff:08x}"
+
+            route = [node_name(packet.to)]
+            route += [node_name(n) for n in route_disc.route]
+            route.append(node_name(getattr(packet, 'from')))
+
+            route_back = [node_name(getattr(packet, 'from'))]
+            route_back += [node_name(n) for n in route_disc.route_back]
+            route_back.append(node_name(packet.to))
+
+            return {
+                "route": route,
+                "route_back": route_back,
+                "snr_back": [s / 4 for s in route_disc.snr_back],
+                "snr_towards": [s / 4 for s in route_disc.snr_towards]
+            }
+        except Exception as e:
+            logger.error(f"Error decoding traceroute: {e}")
+            return None
+
+    def convert_paxcounter(self, decoded):
+        if paxcount_pb2 is None:
+            logger.warning("paxcount_pb2 unavailable; cannot decode paxcounter")
+            return None
+        try:
+            pax = paxcount_pb2.Paxcount()
+            pax.ParseFromString(decoded.payload)
+            return {
+                "wifi_count": pax.wifi,
+                "ble_count": pax.ble,
+                "uptime": pax.uptime
+            }
+        except Exception as e:
+            logger.error(f"Error decoding paxcounter: {e}")
+            return None
+
+    def convert_remotehardware(self, decoded, json_obj):
+        # Sets json_obj["type"] itself, mirroring the firmware which derives the
+        # type ("gpios_changed"/"gpios_read_reply") from the HardwareMessage.
+        if remote_hardware_pb2 is None:
+            logger.warning("remote_hardware_pb2 unavailable; cannot decode remote hardware")
+            return None
+        try:
+            hw = remote_hardware_pb2.HardwareMessage()
+            hw.ParseFromString(decoded.payload)
+            if hw.type == remote_hardware_pb2.HardwareMessage.Type.GPIOS_CHANGED:
+                json_obj["type"] = "gpios_changed"
+                return {"gpio_value": hw.gpio_value}
+            elif hw.type == remote_hardware_pb2.HardwareMessage.Type.READ_GPIOS_REPLY:
+                json_obj["type"] = "gpios_read_reply"
+                return {"gpio_value": hw.gpio_value, "gpio_mask": hw.gpio_mask}
+            return None
+        except Exception as e:
+            logger.error(f"Error decoding remote hardware: {e}")
+            return None
+
     def start(self):
         logger.info(f"Starting converter for region {self.region}")
         self.client.connect(self.broker, self.port, 60)
