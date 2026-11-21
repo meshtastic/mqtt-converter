@@ -300,7 +300,7 @@ Add health check to mosquitto:
 
 ```yaml
 mosquitto:
-  image: eclipse-mosquitto:2.0
+  image: eclipse-mosquitto:2.0.23-openssl
   healthcheck:
     test: ["CMD", "mosquitto_sub", "-t", "$$SYS/#", "-C", "1", "-i", "healthcheck", "-W", "3"]
     interval: 30s
@@ -438,7 +438,7 @@ version: '3.8'
 
 services:
   mosquitto:
-    image: eclipse-mosquitto:2.0
+    image: eclipse-mosquitto:2.0.23-openssl
     container_name: meshtastic-mosquitto
     ports:
       - "1883:1883"

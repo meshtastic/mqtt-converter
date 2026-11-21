@@ -1,6 +1,6 @@
 services:
   mosquitto:
-    image: eclipse-mosquitto:2-openssl
+    image: eclipse-mosquitto:2.0.23-openssl
     container_name: meshtastic-mosquitto
     ports:
       - "1883:1883"
