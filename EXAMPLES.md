@@ -18,11 +18,13 @@ python3 meshtastic_protobuf_to_json.py --region EU_868
 --port        MQTT port (default: 1883)
 --username    MQTT username (optional)
 --password    MQTT password (optional)
---region      Meshtastic region (default: EU_868)
+--region      Meshtastic region (default: EU_868); "" when the gateways use the root alone
 --root-topic  Root topic (default: msh)
 --psk         Channel PSK for encryption (optional)
 --debug       Enable debug logging
 ```
+
+The converter works on `<root-topic>/<region>/2/...`, or `<root-topic>/2/...` with `--region ""`. That prefix must be exactly the gateways' MQTT root topic, including any leading slash.
 
 ### Docker
 
@@ -90,13 +92,14 @@ Envelope fields:
 
 | Field | Required | Notes |
 |-------|----------|-------|
-| `from` | yes | Your node ID (integer) |
+| `from` | yes | Your node ID (integer). Not the gateway's own node number: the gateway ignores downlink packets from itself |
 | `type` | yes | `sendtext` or `sendposition` |
 | `payload` | yes | String (text) or object (position) |
 | `to` | no | Recipient node ID; omit for broadcast (`0xFFFFFFFF`) |
 | `channel` | no | Channel index |
 | `hopLimit` | no | Hop limit (`hop_limit` also accepted) |
-| `id` | no | Packet ID |
+| `id` | no | Packet ID; a random one is used if omitted |
+| `gateway_id` | no | Defaults to `!mqttconv`. Must not be the receiving gateway's own node ID |
 
 ### Text message (broadcast)
 
