@@ -12,6 +12,7 @@ import logging
 import argparse
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.backends import default_backend
+import secrets
 import struct
 
 try:
@@ -33,6 +34,9 @@ except ImportError:
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+# gateway_id for a JSON downlink that names none: any value except the receiving gateway's own node ID
+DEFAULT_GATEWAY_ID = "!mqttconv"
+
 
 class MeshtasticConverter:
     def __init__(self, broker, port, username, password, region, root_topic, psk=None):
@@ -40,6 +44,8 @@ class MeshtasticConverter:
         self.port = port
         self.region = region
         self.root_topic = root_topic
+        # The prefix the gateways publish under: <root>/<region>, or the root alone when region is empty
+        self.topic_base = f"{root_topic}/{region}" if region else root_topic
         self.psk = self.decode_psk(psk) if psk else None
         
         self.client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
@@ -48,6 +54,16 @@ class MeshtasticConverter:
         self.client.on_connect = self.on_connect
         self.client.on_message = self.on_message
     
+    def topic_levels(self, topic, kind):
+        """Topic levels after <topic_base>/2/<kind>/, or None for a topic outside that prefix.
+
+        Parsed relative to the base, so a root with a leading slash or extra levels keeps its channel and user ID.
+        """
+        prefix = f"{self.topic_base}/2/{kind}/"
+        if not topic.startswith(prefix):
+            return None
+        return topic[len(prefix):].split('/')
+
     def decode_psk(self, psk_str):
         if not psk_str or psk_str.lower() == 'none':
             return None
@@ -159,9 +175,9 @@ class MeshtasticConverter:
     def on_connect(self, client, userdata, flags, rc, properties=None):
         if rc == 0:
 
-            protobuf_topic = f"{self.root_topic}/{self.region}/2/e/#"
+            protobuf_topic = f"{self.topic_base}/2/e/#"
 
-            json_topic = f"{self.root_topic}/{self.region}/2/json/#"
+            json_topic = f"{self.topic_base}/2/json/#"
             
             logger.info(f"Connected to {self.broker}")
             logger.info(f"Subscribing to protobuf: {protobuf_topic}")
@@ -174,10 +190,7 @@ class MeshtasticConverter:
     
     def on_message(self, client, userdata, msg):
         try:
-            topic_parts = msg.topic.split('/')
-            
-
-            if '/json/' in msg.topic and len(topic_parts) >= 5:
+            if self.topic_levels(msg.topic, 'json') is not None:
 
                 try:
                     json_data = json.loads(msg.payload.decode('utf-8'))
@@ -193,7 +206,7 @@ class MeshtasticConverter:
                     return
             
 
-            if '/e/' in msg.topic:
+            if self.topic_levels(msg.topic, 'e') is not None:
                 self.handle_protobuf_to_json(client, msg)
         except Exception as e:
             logger.error(f"Error processing message: {e}")
@@ -203,18 +216,16 @@ class MeshtasticConverter:
             logger.debug(f"Received JSON downlink: {json_data}")
             
 
-            topic_parts = msg.topic.split('/')
-            if len(topic_parts) >= 5:
-                channel_name = topic_parts[4]
-            else:
-                channel_name = "LongFast"
+            levels = self.topic_levels(msg.topic, 'json') or []
+            channel_name = levels[0] if levels and levels[0] else "LongFast"
             
 
             packet = mesh_pb2.MeshPacket()
 
             setattr(packet, 'from', json_data.get('from', 0))
             packet.to = json_data.get('to', 0xFFFFFFFF)
-            packet.id = json_data.get('id', 0)
+            # A packet ID of 0 is never relayed, so pick one when the JSON gives none
+            packet.id = json_data.get('id') or secrets.randbits(32) or 1
             
             if 'channel' in json_data:
                 packet.channel = json_data['channel']
@@ -259,14 +270,15 @@ class MeshtasticConverter:
             envelope = mqtt_pb2.ServiceEnvelope()
             envelope.packet.CopyFrom(packet)
             envelope.channel_id = json_data.get('channel_id', channel_name)
-            envelope.gateway_id = json_data.get('gateway_id', '')
+            # The firmware drops an envelope with no gateway_id, or with its own node ID as gateway_id
+            envelope.gateway_id = json_data.get('gateway_id') or DEFAULT_GATEWAY_ID
             
 
             if self.psk:
                 self.encrypt_packet(envelope.packet)
             
 
-            protobuf_topic = f"{self.root_topic}/{self.region}/2/e/{channel_name}/{envelope.gateway_id}"
+            protobuf_topic = f"{self.topic_base}/2/e/{channel_name}/{envelope.gateway_id}"
             client.publish(protobuf_topic, envelope.SerializeToString())
             logger.info(f"JSON->Protobuf: {msg.topic} -> {protobuf_topic}")
             
@@ -275,12 +287,10 @@ class MeshtasticConverter:
     
     def handle_protobuf_to_json(self, client, msg):
         try:
-            topic_parts = msg.topic.split('/')
-            if len(topic_parts) < 6:
+            levels = self.topic_levels(msg.topic, 'e')
+            if not levels or len(levels) < 2:
                 return
-            
-            channel = topic_parts[4]
-            user_id = topic_parts[5]
+            channel, user_id = levels[0], levels[1]
             
             envelope = mqtt_pb2.ServiceEnvelope()
             envelope.ParseFromString(msg.payload)
@@ -291,7 +301,7 @@ class MeshtasticConverter:
             
             json_data = self.convert_to_json(envelope)
             if json_data:
-                json_topic = f"{self.root_topic}/{self.region}/2/json/{channel}/{user_id}"
+                json_topic = f"{self.topic_base}/2/json/{channel}/{user_id}"
                 # sort_keys matches the firmware's std::map (alphabetical) order.
                 client.publish(json_topic, json.dumps(json_data, separators=(',', ':'), sort_keys=True))
                 logger.debug(f"Protobuf->JSON: {msg.topic} -> {json_topic}")
@@ -634,7 +644,7 @@ if __name__ == "__main__":
     parser.add_argument('--port', type=int, default=1883, help='MQTT port')
     parser.add_argument('--username', default=None, help='MQTT username')
     parser.add_argument('--password', default=None, help='MQTT password')
-    parser.add_argument('--region', default='EU_868', help='Meshtastic region')
+    parser.add_argument('--region', default='EU_868', help='Meshtastic region; "" when the gateways use the root alone')
     parser.add_argument('--root-topic', default='msh', help='Root topic')
     parser.add_argument('--psk', default=None, help='Channel PSK for encryption (hex, base64:xxx, or "default")')
     parser.add_argument('--debug', action='store_true', help='Enable debug logging')
