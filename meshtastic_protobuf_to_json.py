@@ -142,7 +142,9 @@ class MeshtasticConverter:
 
             packet_id = packet.id if packet.id else 0
             from_node = getattr(packet, 'from')
-            nonce = struct.pack('<I', packet_id) + struct.pack('<I', from_node) + bytes(8)
+            # Same layout as decrypt_packet and the firmware's CryptoEngine::initNonce:
+            # 64-bit packet ID, then the 32-bit sender, then 4 zero bytes.
+            nonce = struct.pack('<I', packet_id) + bytes(4) + struct.pack('<I', from_node) + bytes(4)
             
 
             cipher = Cipher(algorithms.AES(key), modes.CTR(nonce), backend=default_backend())
