@@ -485,8 +485,18 @@ class MeshtasticConverter:
                 result["pm10"] = aq.pm10_standard
             if aq.HasField('pm25_standard'):
                 result["pm25"] = aq.pm25_standard
+            if aq.HasField('pm40_standard'):
+                result["pm40"] = aq.pm40_standard
             if aq.HasField('pm100_standard'):
                 result["pm100"] = aq.pm100_standard
+            if aq.HasField('pm_temperature'):
+                result["pm_temperature"] = aq.pm_temperature
+            if aq.HasField('pm_humidity'):
+                result["pm_humidity"] = aq.pm_humidity
+            if aq.HasField('pm_voc_idx'):
+                result["pm_voc_idx"] = aq.pm_voc_idx
+            if aq.HasField('pm_nox_idx'):
+                result["pm_nox_idx"] = aq.pm_nox_idx
             if aq.HasField('co2'):
                 result["co2"] = aq.co2
             if aq.HasField('co2_temperature'):
